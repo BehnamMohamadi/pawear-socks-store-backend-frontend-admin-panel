@@ -1,0 +1,41 @@
+const crypto = require('node:crypto');
+const User = require('../models/user-model');
+const Cart = require('../models/shopping-models/cart-model');
+const { verifyAccessToken } = require('../utils/jwt');
+exports.viewContext = async (req, res, next) => {
+  try {
+    res.locals.user = null;
+    res.locals.cartCount = 0;
+    res.locals.wishlistIds = [];
+    res.locals.currentPath = req.path;
+    res.locals.money = n => Number(n || 0).toLocaleString('fa-IR') + ' تومان';
+    res.locals.date = d => d ? new Date(d).toLocaleString('fa-IR') : '—';
+    res.locals.statusLabel = require('../utils/status-labels');
+    res.locals.siteUrl = (process.env.SITE_URL || 'http://127.0.0.1:3000').replace(/\/$/, '');
+    res.locals.seo = { description: 'خرید جوراب تکی با سایزبندی متنوع و باکس‌های آماده از فروشگاه فارسی پاور.', canonical: res.locals.siteUrl + req.path, noindex: true, jsonld: null };
+    const storefront = !/^\/(admin|login|signup|forgot-password|reset-password)(\/|$)/.test(req.path);
+    res.locals.shippingRates = storefront ? await require('../services/shopping-services/shipping-service').getShippingSettings() : { methods: [] };
+    const methods = res.locals.shippingRates?.methods || [];
+    res.locals.shippingAmount = methods.length ? Math.max(0,...methods.filter(m=>m.isActive!==false).map(m=>Math.max(Number(m.sockAmount||0),Number(m.boxAmount||0)))) : Math.max(Number(res.locals.shippingRates?.sockAmount||0),Number(res.locals.shippingRates?.boxAmount||0));
+    if (req.cookies?.accessToken) {
+      let payload;
+      try { payload = verifyAccessToken(req.cookies.accessToken); } catch { /* anonymous */ }
+      if (payload) {
+        const user = await User.findById(payload.sub).select('+tokenVersion');
+        if (user?.accountStatus.status === 'active' && payload.ver === (user.tokenVersion || 0)) {
+          req.user = user; req.auth = payload; res.locals.user = user;
+          const [wishlist, cart] = storefront ? await Promise.all([
+            require('../models/shopping-models/wishlist-model').findOne({user:user._id}).select('items.product').lean(),
+            Cart.findOne({ user: user._id }).select('items.quantity').lean()
+          ]) : [null, null];
+          res.locals.wishlistIds = (wishlist?.items||[]).map(i=>String(i.product));
+          res.locals.cartCount = cart?.items.reduce((n, i) => n + i.quantity, 0) || 0;
+        }
+      }
+    }
+    res.set('Cache-Control', 'private, no-store');
+    next();
+  } catch (error) { next(error); }
+};
+exports.nonce = (req, res, next) => { res.locals.nonce = crypto.randomBytes(18).toString('base64'); next(); };
+exports.requireViewUser = (req, res, next) => req.user ? next() : res.redirect('/login?next=' + encodeURIComponent(req.originalUrl));

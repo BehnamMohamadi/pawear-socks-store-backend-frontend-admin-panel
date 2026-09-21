@@ -1,0 +1,516 @@
+process.env.NODE_ENV = 'test';
+process.env.JWT_SECRET = 'test-only-secret-PAWEAR-abcdefghijklmnopqrstuvwxyz';
+process.env.SMS_PROVIDER = 'test';
+process.env.PAYMENT_GATEWAY = 'mock';
+process.env.PAYMENT_AMOUNT_MULTIPLIER = '10';
+process.env.SHIPPING_AMOUNT_TOMAN = '30000';
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const mongoose = require('mongoose');
+const { randomUUID } = require('node:crypto');
+const app = require('../app');
+const User = require('../models/user-model');
+const Product = require('../models/product-models/product-model');
+const Brand = require('../models/product-models/brand-model');
+const SizeOption = require('../models/product-models/size-option-model');
+const ColorOption = require('../models/product-models/color-option-model');
+const Box = require('../models/product-models/box-model');
+const Cart = require('../models/shopping-models/cart-model');
+const Order = require('../models/shopping-models/order-model');
+const Payment = require('../models/shopping-models/payment-model');
+const Otp = require('../models/otp-model');
+const Category = require('../models/product-models/category-model');
+const SubCategory = require('../models/product-models/subCategory-model');
+const Address = require('../models/address-model');
+const { testOutbox } = require('../services/auth-services/sms-service');
+const { authRateLimit } = require('../middleware/auth-rate-limit');
+const { expireStalePayments } = require('../services/shopping-services/payment-service');
+test('PAWEAR backend integration with isolated replica-set database', async (t) => {
+    const dbName = 'pawear_test_' + randomUUID().replaceAll('-', '');
+    const uri = process.env.TEST_MONGODB_URI;
+    assert.ok(uri, 'Use npm test to start an isolated test replica set.');
+    await mongoose.connect(uri, { dbName, serverSelectionTimeoutMS: 5000 });
+    await Promise.all([User, Product, Box, Cart, Order, Payment, Otp, Category, SubCategory, Address].map(m => m.init()));
+    const server = app.listen(0, '127.0.0.1');
+    await new Promise(resolve => server.once('listening', resolve));
+    const base = 'http://127.0.0.1:' + server.address().port;
+    t.after(async () => { await new Promise(resolve => server.close(resolve)); if (mongoose.connection.name === dbName && dbName.startsWith('pawear_test_'))
+        await mongoose.connection.dropDatabase(); await mongoose.disconnect(); });
+    const request = async (path, method = 'GET', body, cookie, extra = {}) => { const r = await fetch(base + path, {
+        method, headers: {
+            'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}), ...extra
+        }, ...(body ? { body: JSON.stringify(body) } : {})
+    }); return {
+        status: r.status, data: r.status === 204 ? null : await r.json(), cookie: r.headers.get('set-cookie')?.split(';')[0]
+    }; };
+    const resetLimit = () => { authRateLimit.resetKey('127.0.0.1'); authRateLimit.resetKey('::ffff:127.0.0.1'); };
+    let brand;
+    let adminCookie, userCookie, secondCookie, userId, product, other, box, address, category, sub;
+    await t.test('password registration, hashed response exclusion, role protection', async () => {
+        const a = await request('/api/auth/register', 'POST', {
+            firstname: 'بهنام', lastname: 'محمدی', phonenumber: '09120000001', password: 'Strong-test-pass'
+        });
+        assert.equal(a.status, 201);
+        assert.equal(a.data.data.user.password, undefined);
+        assert.equal(a.data.data.user.tokenVersion, undefined);
+        adminCookie = a.cookie;
+        await User.updateOne({ _id: a.data.data.user._id }, { $set: { role: 'admin' } });
+        const u = await request('/api/auth/register', 'POST', {
+            firstname: 'کاربر', lastname: 'آزمایشی', phonenumber: '09120000002', password: 'Strong-test-pass'
+        });
+        assert.equal(u.status, 201);
+        userCookie = u.cookie;
+        userId = u.data.data.user._id;
+        const v = await request('/api/auth/register', 'POST', {
+            firstname: 'مشتری', lastname: 'دومین', phonenumber: '09120000003', password: 'Strong-test-pass'
+        });
+        secondCookie = v.cookie;
+        assert.equal((await request('/api/users', 'GET', null, userCookie)).status, 403);
+        const injection = await request('/api/auth/register', 'POST', {
+            firstname: 'کاربر', lastname: 'دیگری', phonenumber: '09120000009', password: 'Strong-test-pass', role: 'admin'
+        });
+        assert.equal(injection.status, 400);
+    });
+    await t.test('catalog, free size, admin-only boxes, prices and inactive filters', async () => {
+        brand = await Brand.create({name:'پاور'});
+        await SizeOption.insertMany(['FREE-SIZE','40-43','43-46'].map(label=>({label})));
+        await ColorOption.create({name:'سفید',code:'#ffffff'});
+        category = await Category.create({ name: 'جوراب', slug: 'socks' });
+        sub = await SubCategory.create({
+            name: 'روزمره', slug: 'daily', category: category._id
+        });
+        const create = async (name, price, stock) => request('/api/products', 'POST', {
+            name, category: String(category._id), subCategory: String(sub._id), brandId:String(brand._id), variants:[{size:'FREE-SIZE',color:'سفید',price,stock}]
+        }, adminCookie);
+        const a = await create('جوراب آبی', 100000, 20);
+        assert.equal(a.status, 201, JSON.stringify(a.data));
+        product = a.data.data.product;
+        assert.equal(product.size, 'free-size');
+        other = (await create('جوراب سفید', 150000, 30)).data.data.product;
+        assert.equal((await request('/api/products', 'POST', {
+            name: 'تست', category: String(category._id), subCategory: String(sub._id), price: -1
+        }, adminCookie)).status, 400);
+        const b = await request('/api/boxes', 'POST', {
+            name: 'باکس سه جفتی', products: [{ product: product._id, quantity: 2 }, { product: other._id, quantity: 1 }], discount: 10
+        }, adminCookie);
+        assert.equal(b.status, 201);
+        box = b.data.data.box;
+        assert.equal(box.finalPrice, 315000);
+        assert.equal(box.stock, 10);
+        assert.equal(box.pairCount, 3);
+        assert.equal((await request('/api/boxes', 'POST', { name: 'غیرمجاز', products: [{ product: product._id, quantity: 2 }] }, userCookie)).status, 403);
+        assert.equal((await request('/api/boxes', 'POST', { name: 'یک جفت', products: [{ product: product._id, quantity: 1 }] }, adminCookie)).status, 400);
+        const inactive = await Product.create({
+            name: 'غیرفعال', category: category._id, subCategory: sub._id, brandId:brand._id, price: 100000, isActive: false
+        });
+        const list = await request('/api/products?isActive=false');
+        assert.equal(list.status, 200);
+        assert.ok(list.data.data.products.every(p => p.isActive));
+        assert.ok(!list.data.data.products.some(p => p._id === String(inactive._id)));
+    });
+    await t.test('mixed cart aggregates single and box consumption and rejects overselling', async () => {
+        let r = await request('/api/cart', 'POST', {
+            itemType: 'Product', item: product._id, quantity: 1
+        }, userCookie);
+        assert.equal(r.status, 200);
+        r = await request('/api/cart', 'POST', {
+            itemType: 'Box', item: box._id, quantity: 10
+        }, userCookie);
+        assert.equal(r.status, 409);
+        r = await request('/api/cart', 'POST', {
+            itemType: 'Box', item: box._id, quantity: 2
+        }, userCookie);
+        assert.equal(r.status, 200);
+        const checkout = await request('/api/checkout', 'POST', {}, userCookie);
+        assert.equal(checkout.data.data.checkout.totalAmount, 760000);
+        assert.equal(checkout.data.data.checkout.totalPairs, 7);
+        const removed = r.data.data.cart.items[0]._id;
+        assert.equal((await request('/api/cart/' + removed, 'PATCH', { quantity: 2 }, secondCookie)).status, 404);
+    });
+    await t.test('order snapshots, ownership, reservation and duplicate payment', async () => {
+        address = (await request('/api/addresses', 'POST', {
+            title: 'خانه', recipientName: 'کاربر آزمایشی', recipientPhone: '09120000002', province: 'تهران', city: 'تهران', addressLine: 'خیابان آزمایشی، پلاک ۱', buildingNumber:'1', postalCode: '1234567890'
+        }, userCookie)).data.data.address;
+        const r = await request('/api/orders', 'POST', { addressId: address._id }, userCookie);
+        assert.equal(r.status, 201);
+        const order = r.data.data.order;
+        assert.equal(order.totalAmount, 760000);
+        assert.equal(order.items[1].components.length, 2);
+        assert.equal((await request('/api/orders/' + order._id, 'GET', null, secondCookie)).status, 404);
+        assert.equal((await Product.findById(product._id)).stock,20);
+        assert.ok((await Cart.findOne({user:order.user})).items.length>0);
+        const review=await fetch(base+'/orders/'+order._id,{headers:{Cookie:userCookie}});
+        assert.equal(review.status,200);
+        assert.equal((await Product.findById(product._id)).stock,20);
+        assert.ok((await Cart.findOne({user:order.user})).items.length>0);
+        const pay = await request('/api/payments/order/' + order._id, 'POST', {}, userCookie);
+        assert.equal(pay.status, 201);
+        assert.equal((await Product.findById(product._id)).stock, 15);
+        assert.equal((await Product.findById(other._id)).stock, 28);
+        assert.equal((await request('/api/payments/order/' + order._id, 'POST', {}, userCookie)).status, 409);
+        assert.match(pay.data.data.redirectUrl,/^\/payments\/mock\//);
+        const gateway=await fetch(base+pay.data.data.redirectUrl,{headers:{Cookie:userCookie}});
+        assert.equal(gateway.status,200);
+        assert.match(await gateway.text(),/data-mock-payment/);
+        assert.equal((await fetch(base+pay.data.data.redirectUrl,{headers:{Cookie:secondCookie}})).status,404);
+        assert.equal((await Order.findById(order._id)).status,'payment_pending');
+        assert.equal((await Cart.findOne({user:order.user})).items.length,0);
+        const path = pay.data.data.mockVerifyPath;
+        const results = await Promise.all([request(path, 'POST', {}, userCookie), request(path, 'POST', {}, userCookie)]);
+        for (const v of results)
+            assert.equal(v.status, 200);
+        assert.equal((await Product.findById(product._id)).stock, 15);
+        assert.equal((await Order.findById(order._id)).status, 'confirmed');
+        assert.equal((await request('/api/orders/'+order._id+'/received','POST',{},userCookie)).status,409);
+        assert.equal((await request('/api/orders/admin/' + order._id, 'PATCH', { status: 'confirmed' }, adminCookie)).status, 400);
+        assert.equal((await request('/api/orders/admin/' + order._id, 'PATCH', { status: 'delivered' }, adminCookie)).status, 409);
+        assert.equal((await request('/api/orders/admin/' + order._id, 'PATCH', { status: 'shipped', trackingCode: 'TEST-TRACK' }, adminCookie)).status, 200);
+        assert.equal((await request('/api/orders/admin/' + order._id, 'PATCH', { status: 'delivered' }, adminCookie)).status, 200);
+        assert.equal((await request('/api/orders/'+order._id+'/received','POST',{},secondCookie)).status,409);
+        const received=await request('/api/orders/'+order._id+'/received','POST',{},userCookie);
+        assert.equal(received.status,200);
+        assert.ok(received.data.data.order.shippedAt);
+        assert.ok(received.data.data.order.deliveredAt);
+        assert.ok(received.data.data.order.customerReceivedAt);
+        const duplicate=await request('/api/orders/'+order._id+'/received','POST',{},userCookie);
+        assert.equal(duplicate.data.data.order.customerReceivedAt,received.data.data.order.customerReceivedAt);
+    });
+    await t.test('cart edits and price changes require preparing a fresh order', async () => {
+        await request('/api/cart', 'POST', {
+            itemType: 'Product', item: product._id, quantity: 1
+        }, userCookie);
+        const order = (await request('/api/orders', 'POST', { addressId: address._id }, userCookie)).data.data.order;
+        await Product.updateOne({ _id: product._id }, { $set: { price: 110000, 'variants.0.price':110000 } });
+        assert.equal((await request('/api/payments/order/' + order._id, 'POST', {}, userCookie)).status, 409);
+        await request('/api/orders', 'POST', { addressId: address._id }, userCookie);
+        await request('/api/cart', 'POST', {
+            itemType: 'Product', item: other._id, quantity: 1
+        }, userCookie);
+        assert.equal((await request('/api/payments/order/' + order._id, 'POST', {}, userCookie)).status, 409);
+    });
+    await t.test('expiration restores reservation exactly once and late payment requires review', async () => {
+        const order = (await request('/api/orders', 'POST', { addressId: address._id }, userCookie)).data.data.order;
+        const before = (await Product.findById(product._id)).stock;
+        const pay = (await request('/api/payments/order/' + order._id, 'POST', {}, userCookie)).data.data;
+        await Payment.updateOne({ _id: pay.payment._id }, { $set: { expiresAt: new Date(Date.now() - 1000) } });
+        await Promise.all([expireStalePayments(), expireStalePayments()]);
+        assert.equal((await Product.findById(product._id)).stock, before);
+        assert.equal((await Order.findById(order._id)).status, 'expired');
+        assert.equal((await request(pay.mockVerifyPath, 'POST', {}, userCookie)).status, 200);
+        assert.equal((await Order.findById(order._id)).status, 'review');
+        assert.equal((await Product.findById(product._id)).stock, before);
+        const path = '/api/payments/admin/' + pay.payment._id + '/review';
+        const resolutions = await Promise.all([request(path, 'PATCH', { resolution: 'stock_supplied' }, adminCookie), request(path, 'PATCH', { resolution: 'stock_supplied' }, adminCookie)]);
+        for (const r of resolutions)
+            assert.equal(r.status, 200);
+        assert.equal((await Product.findById(product._id)).stock, before - 1);
+        assert.equal((await request(path, 'PATCH', { resolution: 'refunded', refundReference: 'MANUAL-TEST' }, adminCookie)).status, 409);
+    });
+    await t.test('OTP cooldown, wrong attempts, one-use verification, password setup and logout revocation', async () => {
+        resetLimit();
+        const phone = '09120000004';
+        let r = await request('/api/auth/otp/request', 'POST', { phonenumber: phone });
+        assert.equal(r.status, 200);
+        assert.equal(r.data.data.code, undefined);
+        assert.equal((await request('/api/auth/otp/request', 'POST', { phonenumber: phone })).status, 429);
+        const code = testOutbox.get(phone);
+        assert.ok(code);
+        assert.equal((await request('/api/auth/otp/verify', 'POST', { phonenumber: phone, code: '000000' })).status, 400);
+        r = await request('/api/auth/otp/verify', 'POST', {
+            phonenumber: phone, code, firstname: 'کاربر', lastname: 'پیامکی'
+        });
+        assert.equal(r.status, 200);
+        const cookie = r.cookie;
+        const setupPage=await fetch(base+'/login/password',{headers:{Cookie:cookie},redirect:'manual'});
+        assert.equal(setupPage.status,200);
+        assert.ok(!(await setupPage.text()).includes('currentPassword'));
+        assert.equal((await request('/api/auth/otp/verify', 'POST', { phonenumber: phone, code })).status, 400);
+        r = await request('/api/auth/password', 'PUT', { password: 'New-password-123' }, cookie);
+        assert.equal(r.status, 200);
+        const newCookie = r.cookie;
+        assert.equal((await request('/api/auth/password','PUT',{password:'Another-password-123'},newCookie)).status,403);
+        assert.equal((await request('/api/account', 'GET', null, cookie)).status, 401);
+        const login = await request('/api/auth/login', 'POST', { phonenumber: phone, password: 'New-password-123' });
+        assert.equal(login.status, 200);
+        assert.equal(login.data.data.user.password, undefined);
+        await request('/api/auth/logout', 'POST', {}, newCookie);
+        assert.equal((await request('/api/account', 'GET', null, login.cookie)).status, 401);
+    });
+    await t.test('OTP five-guess lockout and expiration enforced without TTL cleanup', async () => {
+        resetLimit();
+        const phone = '09120000005';
+        await request('/api/auth/otp/request', 'POST', { phonenumber: phone });
+        const code = testOutbox.get(phone);
+        for (let i = 0; i < 5; i++)
+            assert.equal((await request('/api/auth/otp/verify', 'POST', { phonenumber: phone, code: '000000' })).status, 400);
+        assert.equal((await request('/api/auth/otp/verify', 'POST', {
+            phonenumber: phone, code, firstname: 'کاربر', lastname: 'قفل‌شده'
+        })).status, 400);
+        resetLimit();
+        const phone2 = '09120000006';
+        await request('/api/auth/otp/request', 'POST', { phonenumber: phone2 });
+        await Otp.updateOne({ phonenumber: phone2 }, { $set: { expiresAt: new Date(Date.now() - 1) } });
+        assert.equal((await request('/api/auth/otp/verify', 'POST', {
+            phonenumber: phone2, code: testOutbox.get(phone2), firstname: 'کاربر', lastname: 'منقضی'
+        })).status, 400);
+    });
+    await t.test('last-unit concurrent buyers cannot both reserve stock', async () => {
+        const limited = await Product.create({
+            name: 'آخرین جفت', category: category._id, subCategory: sub._id, brandId:brand._id, price: 90000, stock: 1
+        });
+        const address2 = await Address.create({
+            user: (await User.findOne({ phonenumber: '09120000003' }))._id, title: 'خانه', recipientName: 'مشتری دومین', recipientPhone: '09120000003', province: 'تهران', city: 'تهران', addressLine: 'خیابان تست پلاک دو', buildingNumber:'1', postalCode: '1234567890', isDefault: true
+        });
+        await request('/api/cart', 'DELETE', null, userCookie);
+        await request('/api/cart', 'DELETE', null, secondCookie);
+        for (const cookie of [userCookie, secondCookie])
+            assert.equal((await request('/api/cart', 'POST', {
+                itemType: 'Product', item: String(limited._id), quantity: 1
+            }, cookie)).status, 200);
+        const one = (await request('/api/orders', 'POST', { addressId: address._id }, userCookie)).data.data.order;
+        const two = (await request('/api/orders', 'POST', { addressId: String(address2._id) }, secondCookie)).data.data.order;
+        const results = await Promise.all([request('/api/payments/order/' + one._id, 'POST', {}, userCookie), request('/api/payments/order/' + two._id, 'POST', {}, secondCookie)]);
+        assert.deepEqual(results.map(r => r.status).sort(), [201, 409]);
+        assert.equal((await Product.findById(limited._id)).stock, 0);
+    });
+    await t.test('box gallery uploads, retained-image validation and soft product deletion', async () => {
+        const bytes = await require('sharp')({ create: {
+                width: 16, height: 16, channels: 3, background: '#1745ff'
+            } }).png().toBuffer();
+        const body = new FormData();
+        body.append('images', new Blob([bytes], { type: 'image/png' }), 'test.png');
+        const r = await fetch(base + '/api/boxes/' + box._id + '/images', {
+            method: 'POST', headers: { Cookie: adminCookie }, body
+        });
+        assert.equal(r.status, 200);
+        const data = await r.json();
+        const image = data.data.record.images[0];
+        assert.ok(image.startsWith('/images/catalog/'));
+        assert.equal((await request('/api/boxes/' + box._id + '/images', 'PUT', { images: ['/etc/passwd'] }, adminCookie)).status, 400);
+        assert.equal((await request('/api/boxes/' + box._id + '/images', 'PUT', { images: [image], coverImage: image }, adminCookie)).status, 200);
+        const pngName = require('node:path').basename(image);
+        await require('node:fs/promises').unlink(require('node:path').join(__dirname, '../public/images/catalog', pngName));
+        const unused = await Product.create({
+            name: 'قابل حذف', category: category._id, subCategory: sub._id, brandId:brand._id, price: 1000, stock: 1
+        });
+        assert.equal((await request('/api/products/' + unused._id, 'DELETE', null, adminCookie)).status, 204);
+        assert.equal((await Product.findById(unused._id)).isActive, false);
+    });
+    await t.test('OTP concurrent replay grants one session only', async () => {
+        resetLimit();
+        const phonenumber = '09120000007';
+        await request('/api/auth/otp/request', 'POST', { phonenumber });
+        const body = {
+            phonenumber, code: testOutbox.get(phonenumber), firstname: 'کاربر', lastname: 'همزمان'
+        };
+        const responses = await Promise.all([request('/api/auth/otp/verify', 'POST', body), request('/api/auth/otp/verify', 'POST', body)]);
+        assert.deepEqual(responses.map(r => r.status).sort(), [200, 400]);
+    });
+    await t.test('parallel address changes preserve one default and do not promote unrelated addresses', async () => {
+        const body = { title: 'جدید', recipientName: 'کاربر آزمایشی', recipientPhone: '09120000002', province: 'تهران', city: 'تهران', addressLine: 'نشانی آزمایشی دیگر', buildingNumber:'1', postalCode: '1234567890' };
+        const created = await Promise.all([request('/api/addresses', 'POST', body, userCookie), request('/api/addresses', 'POST', body, userCookie)]);
+        created.forEach(r => assert.equal(r.status, 201));
+        let addresses = await Address.find({ user: userId });
+        assert.equal(addresses.filter(a => a.isDefault).length, 1);
+        assert.equal(String(addresses.find(a => a.isDefault)._id), address._id);
+        const nonDefault = created[0].data.data.address._id;
+        assert.equal((await request('/api/addresses/' + nonDefault, 'PATCH', { isDefault: false }, userCookie)).status, 200);
+        addresses = await Address.find({ user: userId });
+        assert.equal(addresses.filter(a => a.isDefault).length, 1);
+        await Promise.all(created.map(r => request('/api/addresses/' + r.data.data.address._id + '/default', 'PATCH', {}, userCookie)));
+        addresses = await Address.find({ user: userId });
+        assert.equal(addresses.filter(a => a.isDefault).length, 1);
+    });
+    await t.test('SSR storefront, admin authorization and real catalog stay synchronized', async () => {
+        const html = async (path, cookie) => { const response = await fetch(base + path, { headers: { Accept: 'text/html', ...(cookie ? { Cookie: cookie } : {}) }, redirect: 'manual' }); return { response, text: await response.text() }; };
+        const publicPages = ['/', '/shop', '/boxes', '/about', '/contact', '/size-guide', '/shipping', '/terms', '/privacy', '/login', '/signup', '/admin/login'];
+        for (const path of publicPages) {
+            const r = await html(path); assert.equal(r.response.status, 200, path + ': ' + r.text.slice(0, 200));
+            assert.match(r.text, /<html lang="fa" dir="rtl">/);
+            assert.match(r.text, /rel="canonical"/);
+            if (['/login','/signup','/admin/login'].includes(path)) {
+                assert.ok(!r.text.includes('class="site-header"'));
+                assert.ok(!r.text.includes('class="site-footer"'));
+                assert.match(r.text,/id="authTabPassword"/);
+                assert.match(r.text,/id="authTabOtp"/);
+                assert.match(r.text,/autocomplete="one-time-code"/);
+            }
+        }
+        assert.equal((await html('/admin')).response.status, 302);
+        assert.equal((await html('/admin', userCookie)).response.status, 403);
+        assert.equal((await html('/checkout')).response.status, 302);
+        for (const path of ['/admin', ...['products','boxes','categories','subcategories','users','orders','payments','carts'].map(k=>'/admin/'+k), ...['products','boxes','categories','subcategories','users'].map(k=>'/admin/'+k+'/new'), '/admin/products/'+product._id+'/edit', '/admin/boxes/'+box._id+'/edit']) {
+            const r = await html(path, adminCookie); assert.equal(r.response.status, 200, path + ': ' + r.text.slice(0, 300)); assert.match(r.text, /noindex/);
+        }
+        for (const path of ['/cart','/checkout','/account','/wishlist']) assert.equal((await html(path,userCookie)).response.status,200,path);
+        assert.ok(!(await html('/account',userCookie)).text.includes('passwordForm'));
+        assert.match((await html('/admin/orders',adminCookie)).text,/data-live-filter/);
+        assert.match((await html('/admin/payments',adminCookie)).text,/ops-table/);
+        const mine=await Order.findOne({user:userId});
+        assert.equal((await html('/orders/'+mine._id,userCookie)).response.status,200);
+        assert.equal((await html('/orders/'+mine._id,secondCookie)).response.status,404);
+        const pay=await Payment.findOne();
+        assert.equal((await html('/admin/orders/'+mine._id,adminCookie)).response.status,200);
+        assert.equal((await html('/admin/payments/'+pay._id,adminCookie)).response.status,200);
+        const cart=await Cart.findOne();
+        assert.equal((await html('/admin/carts/'+cart._id,adminCookie)).response.status,200);
+        const changed=await request('/api/products/'+product._id,'PATCH',{name:'جوراب هماهنگ پاور',variants:product.variants.map(v=>({_id:v._id,size:v.size,color:v.color,price:123456,stock:20})),description:'توضیح واقعی محصول <script>alert(1)</script>'},adminCookie);
+        assert.equal(changed.status,200);
+        const slug=changed.data.data.product.slug;
+        const p=await html('/product/'+encodeURIComponent(slug));
+        assert.equal(p.response.status,200);assert.match(p.text,/جوراب هماهنگ پاور/);
+        const match=p.text.match(/<script type="application\/ld\+json" nonce="([^"]+)">([\s\S]*?)<\/script>/);
+        assert.ok(match);assert.ok(p.response.headers.get('content-security-policy').includes('nonce-'+match[1]));
+        const ld=JSON.parse(match[2]);assert.equal(ld.offers[0].price,1234560);assert.equal(ld.offers[0].priceCurrency,'IRR');assert.ok(!match[2].includes('<script>'));
+        assert.match(p.text,/&lt;script&gt;/);
+        assert.equal((await html('/product/does-not-exist')).response.status,404);
+        assert.equal((await html('/shop?page=9999')).response.status,404);
+        assert.equal((await html('/missing-page')).response.status,404);
+        const filtered=await html('/shop?q='+encodeURIComponent('جوراب هماهنگ'));
+        assert.match(filtered.text,/جوراب هماهنگ پاور/);assert.match(filtered.text,/noindex,follow/);
+        const sitemap=await html('/sitemap.xml');assert.equal(sitemap.response.status,200);assert.ok(sitemap.text.includes(encodeURIComponent(slug)));assert.ok(!sitemap.text.includes('/admin'));
+        assert.match((await html('/robots.txt')).text,/Disallow: \//);
+        for(const asset of ['/javascript/shared/api/api.js','/js/admin/pawear.js','/stylesheet/shared/integration/integration.css','/images/brand/logo-main.png']) assert.equal((await fetch(base+asset)).status,200,asset);
+    });
+    await t.test('checkout page JavaScript prepares the real order and starts its payment', async () => {
+        await request('/api/cart','DELETE',null,userCookie);
+        const fresh = await Product.create({name:'جوراب جریان فرانت',category:category._id,subCategory:sub._id,brandId:brand._id,price:88000,stock:20});
+        assert.equal((await request('/api/cart','POST',{itemType:'Product',item:String(fresh._id),quantity:2},userCookie)).status,200);
+        const nodes = new Map();
+        for (const id of ['#addressForm','#checkoutForm','[data-address-card]','[data-error-for="addressId"]']) nodes.set(id,{hidden:true,handlers:{},addEventListener(event,handler){this.handlers[event]=handler;}});
+        nodes.get('#checkoutForm').querySelector = selector => selector.includes('addressId') ? {value:address._id} : undefined;
+        let started;
+        const context = { document:{querySelector:id=>nodes.get(id),querySelectorAll:()=>[],addEventListener(){}}, location:{reload(){}}, window:{location:{}}, Pawear:{
+            run:fn=>fn, formData:()=>({addressId:address._id}),
+            request:async(path,method,body)=>{const r=await request(path,method,body,userCookie);assert.ok(r.status<300,JSON.stringify(r.data));return r.data;},
+            startPayment:async id=>{const r=await request('/api/payments/order/'+id,'POST',{},userCookie);assert.equal(r.status,201);started=r.data.data.payment;}
+        }};
+        require('node:vm').runInNewContext(require('node:fs').readFileSync(require('node:path').join(__dirname,'../public/javascript/pages/checkout/checkout.js'),'utf8'),context);
+        await nodes.get('#checkoutForm').handlers.submit({currentTarget:nodes.get('#checkoutForm')});
+        assert.match(context.window.location.href,/^\/orders\/[a-f0-9]{24}$/);
+        await context.Pawear.startPayment(context.window.location.href.split('/').pop());
+        assert.ok(started?._id);
+        assert.equal((await Product.findById(fresh._id)).stock,18);
+        assert.equal((await request('/api/payments/mock/'+started._id+'/success','POST',{},userCookie)).status,200);
+        const order=await Order.findById(started.order);assert.equal(order.status,'confirmed');assert.equal(order.totalAmount,206000);
+    });
+    await t.test('V2 shipping settings enforce admin access, mixed maximum and frozen paid totals',async()=>{
+        const Settings=require('../models/store-settings-model');
+        await Settings.init();
+        assert.equal((await request('/api/admin/settings/shipping','PUT',{methods:[{key:'post',name:'پست',sockAmount:45000,boxAmount:70000,isActive:true}]},userCookie)).status,403);
+        assert.equal((await request('/api/admin/settings/shipping','PUT',{sockAmount:-1,boxAmount:70000},adminCookie)).status,400);
+        assert.equal((await request('/api/admin/settings/shipping','PUT',{methods:[{key:'post',name:'پست',sockAmount:45000,boxAmount:70000,isActive:true}]},adminCookie)).status,200);
+        const {quoteShipping}=require('../services/shopping-services/shipping-service');
+        assert.equal((await quoteShipping([{itemType:'Product',quantity:20}])).shippingAmount,45000);
+        assert.equal((await quoteShipping([{itemType:'Box',quantity:3}])).shippingAmount,70000);
+        assert.equal((await quoteShipping([{itemType:'Box'},{itemType:'Product'}])).shippingAmount,70000);
+        assert.equal((await quoteShipping([])).shippingAmount,0);
+        const paid=await Order.findOne({paymentStatus:'paid'}).lean();const oldTotal=paid.totalAmount;
+        const page=await fetch(base+'/admin/settings',{headers:{Cookie:adminCookie}});assert.equal(page.status,200);assert.match(await page.text(),/shippingSettings/);
+        await request('/api/cart','DELETE',null,userCookie);
+        const p=await Product.create({name:'ارسال نسخه دو',category:category._id,subCategory:sub._id,brandId:brand._id,price:90000,stock:10});
+        await request('/api/cart','POST',{itemType:'Product',item:String(p._id),quantity:1},userCookie);
+        const prepared=await request('/api/orders','POST',{addressId:address._id},userCookie);
+        assert.equal(prepared.data.data.order.shippingAmount,45000);
+        await request('/api/admin/settings/shipping','PUT',{methods:[{key:'post',name:'پست',sockAmount:50000,boxAmount:70000,isActive:true}]},adminCookie);
+        assert.equal((await request('/api/payments/order/'+prepared.data.data.order._id,'POST',{},userCookie)).status,409);
+        assert.equal((await Order.findById(paid._id)).totalAmount,oldTotal);
+        await Settings.deleteOne({_id:'shipping'});
+    });
+    await t.test('selected shipping survives checkout and invalid methods are rejected',async()=>{
+        const Settings=require('../models/store-settings-model');
+        await request('/api/cart','DELETE',null,userCookie);
+        await Settings.updateOne({_id:'shipping'},{$set:{methods:[{key:'post',name:'پست',sockAmount:30000,boxAmount:45000,isActive:true,sortOrder:1},{key:'tipax',name:'تیپاکس',sockAmount:60000,boxAmount:90000,isActive:true,sortOrder:2}]}},{upsert:true});
+        await request('/api/cart','POST',{itemType:'Product',item:product._id,quantity:1},userCookie);
+        assert.equal((await request('/api/orders','POST',{addressId:address._id,shippingMethod:'missing'},userCookie)).status,409);
+        const checkoutPage=await fetch(base+'/checkout',{headers:{Cookie:userCookie}});assert.equal(checkoutPage.status,200);assert.match(await checkoutPage.text(),/تیپاکس — ۶۰٬۰۰۰ تومان/);
+        const r=await request('/api/orders','POST',{addressId:address._id,shippingMethod:'tipax'},userCookie);
+        assert.equal(r.data.data.order.shippingMethod.key,'tipax');assert.equal(r.data.data.order.shippingAmount,60000);
+        const pay=await request('/api/payments/order/'+r.data.data.order._id,'POST',{},userCookie);
+        assert.equal(pay.status,201,JSON.stringify(pay.data));
+        await request('/api/payments/mock/'+pay.data.data.payment._id+'/success','POST',{},userCookie);
+        await Settings.deleteOne({_id:'shipping'});
+    });
+    await t.test('admin cart rejects overselling and rolls back when audit fails',async()=>{
+        await request('/api/cart','DELETE',null,userCookie);
+        await request('/api/cart','POST',{itemType:'Product',item:other._id,quantity:1},userCookie);
+        const cart=await Cart.findOne({user:userId}),path='/api/admin/carts/'+cart._id+'/items/'+cart.items[0]._id;
+        assert.equal((await request(path,'PATCH',{quantity:100},adminCookie)).status,409);
+        assert.equal((await Cart.findById(cart._id)).items[0].quantity,1);
+        const Audit=require('../models/shopping-models/cart-admin-audit-model'),original=Audit.create;
+        try{Audit.create=async()=>{throw new Error('Test audit failure');};assert.equal((await request(path,'PATCH',{quantity:2},adminCookie)).status,500);}
+        finally{Audit.create=original;}
+        assert.equal((await Cart.findById(cart._id)).items[0].quantity,1);
+        assert.equal((await request(path,'PATCH',{quantity:2},adminCookie)).status,200);
+        assert.equal(await Audit.countDocuments({cart:cart._id}),1);
+    });
+    await t.test('V2 independent sizes, box components, reservation release and dispatch are synchronized',async()=>{
+        await request('/api/cart','DELETE',null,userCookie);
+        const body={name:'جوراب سایزبندی نسخه دو',category:String(category._id),subCategory:String(sub._id),brandId:String(brand._id),variants:[{size:'40-43',color:'سفید',price:100000,stock:5},{size:'43-46',color:'سفید',price:150000,stock:3}]};
+        const created=await request('/api/products','POST',body,adminCookie);assert.equal(created.status,201,JSON.stringify(created.data));
+        const p=created.data.data.product;assert.equal(p.price,100000);assert.equal(p.stock,8);assert.equal(p.variants[0].size,'40-43');
+        const dup=await request('/api/products','POST',{...body,name:'سایز تکراری',variants:[body.variants[0],{...body.variants[1],size:'40-43'}]},adminCookie);assert.equal(dup.status,400);
+        assert.equal((await request('/api/cart','POST',{itemType:'Product',item:p._id,variantId:'000000000000000000000001',quantity:1},userCookie)).status,400);
+        assert.equal((await request('/api/cart','POST',{itemType:'Product',item:p._id,size:'L',quantity:1},userCookie)).status,400);
+        await request('/api/cart','POST',{itemType:'Product',item:p._id,size:'40-43',quantity:1},userCookie);
+        const second=await request('/api/cart','POST',{itemType:'Product',item:p._id,size:'43-46',quantity:1},userCookie);assert.equal(second.data.data.cart.items.length,2);
+        const b=await request('/api/boxes','POST',{name:'باکس دو سایز',products:[{product:p._id,size:'40-43',quantity:1},{product:p._id,size:'43-46',quantity:1}]},adminCookie);
+        assert.equal(b.status,201,JSON.stringify(b.data));assert.equal(b.data.data.box.finalPrice,250000);
+        assert.equal((await request('/api/cart','POST',{itemType:'Box',item:b.data.data.box._id,quantity:3},userCookie)).status,409);
+        assert.equal((await request('/api/cart','POST',{itemType:'Box',item:b.data.data.box._id,quantity:1},userCookie)).status,200);
+        let prepared=(await request('/api/orders','POST',{addressId:address._id},userCookie)).data.data.order;
+        assert.equal(prepared.subtotal,500000);assert.equal(prepared.inventory.length,2);assert.equal(prepared.inventory[0].quantity,2);
+        let payment=await request('/api/payments/order/'+prepared._id,'POST',{},userCookie);assert.equal(payment.status,201,JSON.stringify(payment.data));
+        const paymentId=payment.data.data.payment._id;
+        let row=await Product.findById(p._id);assert.deepEqual(row.variants.map(v=>v.stock),[3,1]);assert.equal(row.stock,4);
+        assert.equal((await request('/api/products/'+p._id,'PATCH',{variants:p.variants.map(({_id,size,color,price,stock,isActive})=>({_id,size,color,price,stock,isActive}))},adminCookie)).status,409);
+        await Payment.updateOne({_id:paymentId},{$set:{expiresAt:new Date(Date.now()-1000)}});await expireStalePayments();
+        row=await Product.findById(p._id);assert.deepEqual(row.variants.map(v=>v.stock),[5,3]);assert.equal(row.stock,8);
+        await expireStalePayments();assert.equal((await Product.findById(p._id)).stock,8);
+        await request('/api/cart','POST',{itemType:'Product',item:p._id,size:'43-46',quantity:1},userCookie);
+        prepared=(await request('/api/orders','POST',{addressId:address._id},userCookie)).data.data.order;
+        payment=await request('/api/payments/order/'+prepared._id,'POST',{},userCookie);
+        await request('/api/payments/mock/'+payment.data.data.payment._id+'/success','POST',{},userCookie);
+        assert.equal((await request('/api/orders/admin/'+prepared._id,'PATCH',{status:'packed',packingNote:'بسته هدیه'},userCookie)).status,403);
+        assert.equal((await request('/api/orders/admin/'+prepared._id,'PATCH',{status:'packed',packingNote:'بسته هدیه'},adminCookie)).status,200);
+        assert.equal((await request('/api/orders/admin/'+prepared._id,'PATCH',{status:'shipped',carrier:'تیپاکس',trackingCode:'V2-123'},adminCookie)).status,200);
+        const owned=await fetch(base+'/orders/'+prepared._id,{headers:{Cookie:userCookie}});const html=await owned.text();assert.equal(owned.status,200);assert.match(html,/43-46/);assert.match(html,/تیپاکس/);assert.ok(!html.includes('بسته هدیه'));assert.equal((await request('/api/orders/'+prepared._id,'GET',null,userCookie)).data.data.order.packingNote,undefined);
+        const detail=await fetch(base+'/admin/orders/'+prepared._id,{headers:{Cookie:adminCookie}});assert.equal(detail.status,200);assert.match(await detail.text(),/data-print-order/);
+        assert.equal((await request('/api/orders/admin/'+prepared._id,'PATCH',{status:'delivered'},adminCookie)).status,200);
+        const productPage=await fetch(base+'/product/'+encodeURIComponent(p.slug));assert.match(await productPage.text(),/data-variant-picker/);
+        const editPage=await fetch(base+'/admin/products/'+p._id+'/edit',{headers:{Cookie:adminCookie}});assert.match(await editPage.text(),/data-variant-row/);
+        const boxForm=await fetch(base+'/admin/boxes/'+b.data.data.box._id+'/edit',{headers:{Cookie:adminCookie}});assert.match(await boxForm.text(),/43-46/);
+    });
+    await t.test('V2 concurrent purchases reserve only one last size without touching another size',async()=>{
+        const p=await Product.create({name:'آخرین سایز نسخه دو',category:category._id,subCategory:sub._id,brandId:brand._id,price:1,sizes:[{label:'S',price:80000,stock:1},{label:'L',price:95000,stock:7}]});
+        const secondUser=await User.findOne({phonenumber:'09120000003'});const a2=await Address.findOne({user:secondUser._id});
+        const ids=[];
+        for(const [cookie,a] of [[userCookie,address],[secondCookie,a2]]){
+            await request('/api/cart','DELETE',null,cookie);
+            assert.equal((await request('/api/cart','POST',{itemType:'Product',item:String(p._id),size:'S',quantity:1},cookie)).status,200);
+            ids.push((await request('/api/orders','POST',{addressId:String(a._id)},cookie)).data.data.order._id);
+        }
+        const results=await Promise.all(ids.map((id,index)=>request('/api/payments/order/'+id,'POST',{},[userCookie,secondCookie][index])));
+        assert.deepEqual(results.map(r=>r.status).sort(),[201,409]);
+        const after=await Product.findById(p._id);assert.equal(after.sizes[0].stock,0);assert.equal(after.sizes[1].stock,7);
+    });
+    await t.test('production disables mock completion and development SMS driver', async () => {
+        const prior = process.env.NODE_ENV;
+        process.env.NODE_ENV = 'production';
+        try {
+            await assert.rejects(() => require('../services/auth-services/sms-service').sendOtp('09120000008', '123456'), e => e.statusCode === 503);
+            await assert.rejects(() => require('../services/shopping-services/payment-service').completeMockPayment({ paymentId: new mongoose.Types.ObjectId(), userId }), e => e.statusCode === 404);
+        } finally { process.env.NODE_ENV = prior; }
+    });
+    await t.test('security: cross-origin writes, malformed JSON, password projection and last-admin account', async () => {
+        assert.equal((await request('/api/cart', 'POST', {
+            itemType: 'Product', item: product._id, quantity: 1
+        }, userCookie, { Origin: 'https://untrusted.invalid' })).status, 403);
+        const r = await fetch(base + '/api/auth/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{broken'
+        });
+        assert.equal(r.status, 400);
+        assert.equal((await request('/api/users?fields=%2Bpassword', 'GET', null, adminCookie)).status, 400);
+        assert.equal((await request('/api/account', 'DELETE', null, adminCookie)).status, 403);
+    });
+});

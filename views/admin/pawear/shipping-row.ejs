@@ -1,0 +1,8 @@
+<div class="shipping-method" data-shipping-row>
+<label>نام روش ارسال<input data-s-name value="<%= m.name||'' %>" required maxlength="80" placeholder="مثلاً پست"></label>
+<label>شناسه روش<input data-s-key value="<%= m.key||'' %>" required dir="ltr" maxlength="40" placeholder="post"></label>
+<label>هزینه جوراب (تومان)<input data-s-sock type="number" min="0" step="1" required value="<%= m.sockAmount??0 %>" inputmode="numeric"></label>
+<label>هزینه باکس (تومان)<input data-s-box type="number" min="0" step="1" required value="<%= m.boxAmount??0 %>" inputmode="numeric"></label>
+<label>ترتیب نمایش<input data-s-sort type="number" min="0" step="1" value="<%= m.sortOrder??i %>" inputmode="numeric"></label>
+<div class="shipping-method__actions"><label class="shipping-method__active"><input data-s-active type="checkbox" <%= m.isActive!==false?'checked':'' %>>فعال</label><button class="btn btn-danger" type="button" data-remove-shipping>حذف روش</button></div>
+</div>
