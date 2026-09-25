@@ -1,7 +1,13 @@
-# خروجی و گوگل‌شیت
-صفحه: /admin/data-export — همه APIها پشت احراز هویت مدیر هستند.
-راه‌اندازی: Google Sheets API را فعال کنید، Service Account و کلید JSON بسازید. کلید خارج از public و خارج از git نگه داشته شود. GOOGLE_SERVICE_ACCOUNT_FILE مسیر کلید؛ GOOGLE_SHEETS_SPREADSHEET_ID شناسه مقصد است. پس از تغییر تنظیمات سرور را restart کنید. شیت را به ایمیل حساب سرویس با Editor share کنید.
-کالکشن‌ها در snapshot دیتابیس خوانده می‌شوند. بدون تغییر دیتابیس. اسرار و کالکشن‌های احراز هویت صادر نمی‌شوند؛ مشخصات شخصی به‌صورت پیش‌فرض حذف می‌شوند. داده‌های متنی آزاد ممکن است اطلاعات شخصی داشته باشند؛ دسترسی شیت را محدود نگه دارید. آرایه‌ها JSON و اشیای تودرتو ستون‌های نقطه‌دار هستند. متن به‌صورت stringValue نوشته می‌شود تا فرمول اجرا نشود.
-تب‌های دارای metadata مالکیت pawear-export-v1 به‌روزرسانی می‌شوند. تب همنام بدون نشان مالکیت رد می‌شود. تمام تغییرات یک batchUpdate اتمی است. محدودیت‌ها در UI اعلام می‌شوند؛ داده هرگز بی‌صدا truncate نمی‌شود. این گزارش بکاپ قابل بازیابی نیست.
-برای بررسی بدون ارسال، بررسی کالکشن‌ها و دریافت JSON را بزنید. ارسال واقعی نیاز به شناسه مقصد و حساب سرویس دارد. کلید را هرگز در چت نفرستید.
-منابع: https://developers.google.com/identity/protocols/oauth2/service-account و https://developers.google.com/workspace/sheets/api/guides/batch
+# خروجی و گوگل‌شیت بدون Google Cloud
+صفحه: /admin/data-export — APIها پشت احراز هویت مدیر هستند.
+
+این اتصال از Google Apps Script متصل به خود Spreadsheet استفاده می‌کند و به Service Account، فایل JSON یا Google Cloud Console نیاز ندارد.
+
+1. شیت مقصد را باز کنید و Extensions > Apps Script را بزنید.
+2. محتوای docs/google-apps-script.gs را در Code.gs کپی کنید.
+3. WEBHOOK_SECRET را با یک مقدار تصادفی حداقل ۳۲ کاراکتری عوض کنید.
+4. Deploy > New deployment > Web app؛ Execute as: Me؛ دسترسی: Anyone. مجوزهای درخواست‌شده را تأیید کنید.
+5. URL نهایی /exec را در GOOGLE_SHEETS_WEBHOOK_URL و همان secret را در GOOGLE_SHEETS_WEBHOOK_SECRET قرار دهید.
+6. GOOGLE_SHEETS_SPREADSHEET_ID را برابر ID شیت قرار دهید و سرور را restart کنید.
+
+اسکریپت به Spreadsheet والد خودش قفل است و درخواست برای ID شیت دیگری را رد می‌کند. تب‌های خروجی با پیشوند pawear_ ساخته می‌شوند و تب‌های دیگر دست‌نخورده می‌مانند. اسرار و کالکشن‌های احراز هویت در database-export.js حذف می‌شوند و اطلاعات شخصی پیش‌فرض خاموش است. این گزارش جایگزین backup نیست.
