@@ -15,7 +15,8 @@
     "db:backup": "node scripts/backup-local-db.js",
     "db:restore": "node scripts/restore-local-db.js",
     "setup:admin": "node scripts/setup-local-admin.js",
-    "postman:build": "node scripts/build-postman.js"
+    "postman:build": "node scripts/build-postman.js",
+    "seed:brands": "node scripts/seed-brands.js"
   },
   "dependencies": {
     "@code-plate/iran-cities": "^1.0.2",
