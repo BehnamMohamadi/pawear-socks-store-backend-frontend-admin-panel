@@ -9,7 +9,7 @@ router.use('/admin',(req,res,next)=>{
   next();
 });
 router.get('/admin',c.dashboard);router.get('/admin/sales',require('../../controller/admin/sales-controller').page);
-router.get('/admin/settings',require('../../controller/admin/settings-controller').page);
+router.get('/admin/pricing',require('../../controller/admin/pricing-controller').page);router.get('/admin/data-export',require('../../controller/admin/export-controller').page);router.get('/admin/settings',require('../../controller/admin/settings-controller').page);
 const articles=require('../../controller/admin/article-controller');router.get('/admin/articles',articles.list);router.get('/admin/articles/new',articles.editor);router.get('/admin/articles/:id/edit',articles.editor);router.get('/admin/articles/:id/preview',require('../../controller/storefront/journal-controller').article);router.get('/admin/:resource',c.list);
 router.get('/admin/:resource/new',c.form);
 router.get('/admin/:resource/:id/edit',c.form);
