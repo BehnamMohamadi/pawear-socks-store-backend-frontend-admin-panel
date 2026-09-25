@@ -2,6 +2,7 @@ const { Schema, model } = require("mongoose");
 const bcrypt = require("bcrypt");
 const schema = new Schema(
   {
+    gender: { type: String, enum: ['male','female','unknown'], default: 'unknown' },
     firstname: { type: String, required: true, trim: true, minlength: 2, maxlength: 40 },
     lastname: { type: String, required: true, trim: true, minlength: 2, maxlength: 40 },
     phonenumber: { type: String, required: true, unique: true, match: /^09\d{9}$/ },

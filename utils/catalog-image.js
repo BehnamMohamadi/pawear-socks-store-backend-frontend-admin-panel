@@ -1,3 +1,2 @@
-const sharp=require('sharp');
-// A uniform canvas preserves the entire product, including narrow/tall uploads.
-module.exports=buffer=>sharp(buffer,{limitInputPixels:40000000}).rotate().resize(1000,1000,{fit:'contain',background:'#ffffff'}).flatten({background:'#ffffff'}).webp({quality:82});
+const sharp=require('sharp');const {AppError}=require('./app-error');
+module.exports=buffer=>({async toFile(target){const image=sharp(buffer,{limitInputPixels:40000000});const meta=await image.metadata();if(!['jpeg','png','webp'].includes(meta.format)||meta.pages>1)throw new AppError(400,'فقط عکس ثابت JPG، PNG یا WebP مجاز است.');if(meta.width!==meta.height||meta.width<400||meta.width>6000)throw new AppError(400,'عکس محصول باید مربع ۱:۱ و بین ۴۰۰ تا ۶۰۰۰ پیکسل باشد. یک فایل مربع انتخاب کنید.');return image.rotate().resize(1200,1200,{fit:'inside',withoutEnlargement:true}).flatten({background:'#fff'}).webp({quality:82}).toFile(target);}});

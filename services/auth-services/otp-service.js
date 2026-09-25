@@ -32,7 +32,7 @@ const issueOtp = async (phonenumber) => {
     }
     return { expiresIn: 120, retryAfter: 60 };
 };
-const verifyOtp = async ({ phonenumber, code, firstname, lastname }) => {
+const verifyOtp = async ({ phonenumber, code, firstname, lastname, gender }) => {
     // Every attempt, including wrong codes, is counted atomically and never rolled back.
     const otp = await Otp.findOneAndUpdate({
         phonenumber, consumed: false, delivery: 'sent', expiresAt: { $gt: new Date() }, attempts: { $lt: 5 }
@@ -47,8 +47,8 @@ const verifyOtp = async ({ phonenumber, code, firstname, lastname }) => {
         let user = await User.findOne({ phonenumber }).select('+tokenVersion').session(session);
         if (user && user.accountStatus.status !== 'active')
             throw new AppError(403, 'حساب غیرفعال است.');
-        if (!user && (!firstname || !lastname))
-            throw new AppError(400, 'برای تکمیل ثبت‌نام نام و نام خانوادگی را وارد کنید.', null, 'PROFILE_REQUIRED');
+        if (!user && (!firstname || !lastname || !['male','female'].includes(gender)))
+            throw new AppError(400, 'برای تکمیل ثبت‌نام نام، نام خانوادگی و جنسیت را وارد کنید.', null, 'PROFILE_REQUIRED');
         const consumed = await Otp.updateOne({
             _id: otp._id, challenge: otp.challenge, consumed: false, delivery: 'sent', expiresAt: { $gt: new Date() }, attempts: { $lte: 5 }
         }, { $set: { consumed: true } }, { session });
@@ -56,7 +56,7 @@ const verifyOtp = async ({ phonenumber, code, firstname, lastname }) => {
             throw new AppError(400, 'این کد قبلاً استفاده شده است.', null, 'OTP_INVALID');
         if (!user) {
             [user] = await User.create([{
-                    phonenumber, firstname, lastname, role: 'user'
+                    phonenumber, firstname, lastname, gender, role: 'user'
                 }], { session });
         }
         return user;

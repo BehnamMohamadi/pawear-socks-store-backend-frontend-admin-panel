@@ -17,7 +17,7 @@ const uploadCatalogImages=type=>catchAsync(async(req,res)=>{
   for(const file of req.files){
    const filename=randomUUID()+'.webp';
    try{await catalogImage(file.buffer).toFile(path.join(dir,filename));}
-   catch(error){if(error.code&&['EACCES','ENOSPC','ENOENT'].includes(error.code))throw error;throw new AppError(400,'فایل تصویر معتبر نیست.');}
+   catch(error){if(error.isOperational)throw error;if(error.code&&['EACCES','ENOSPC','ENOENT'].includes(error.code))throw error;throw new AppError(400,'فایل تصویر معتبر نیست.');}
    files.push(filename);
   }
   record.images.push(...files.map(f=>'/images/catalog/'+f));if(record.coverImage==='/images/product-placeholder.svg')record.coverImage=record.images[0];await record.save();
@@ -31,6 +31,7 @@ const editCatalogImages=type=>catchAsync(async(req,res)=>{
  if(images.some(image=>!record.images.includes(image)))throw new AppError(400,'فقط تصاویر قبلاً آپلودشده همین کالا مجاز است.');
  if(req.body.coverImage&&!images.includes(req.body.coverImage))throw new AppError(400,'تصویر جلد باید در گالری باشد.');
  // Retain removed physical files for existing order snapshots; background cleanup can be added later.
+ if((record.colorImages||[]).some(g=>g.images.some(image=>!images.includes(image))))throw new AppError(400,'این عکس به یک رنگ متصل است؛ ابتدا در گالری رنگ جایگزینش کنید.');
  record.images=images;record.coverImage=req.body.coverImage||images[0]||'/images/product-placeholder.svg';await record.save();
  res.json({status:'success',data:{record}});
 });

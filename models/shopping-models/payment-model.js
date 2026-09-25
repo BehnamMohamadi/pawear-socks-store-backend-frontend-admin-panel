@@ -278,4 +278,5 @@ paymentSchema.index({
   createdAt: -1,
 });
 
+paymentSchema.index({status:1,verifiedAt:1,order:1});paymentSchema.index({user:1,status:1,verifiedAt:1});
 module.exports = model("Payment", paymentSchema);

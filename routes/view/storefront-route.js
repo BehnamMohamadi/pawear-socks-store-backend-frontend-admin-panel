@@ -1,7 +1,7 @@
 const router = require('express').Router();
 const c = require('../../controller/storefront/storefront-controller');
 const { requireViewUser } = require('../../middleware/view-context');
-router.get('/', c.home);
+const journal=require('../../controller/storefront/journal-controller');router.get('/journal',journal.list);router.get('/journal/:slug',journal.article);router.get('/', c.home);
 router.get('/shop', c.shop);
 router.get('/boxes', c.boxes);
 router.get('/product/:slug', c.product('Product'));

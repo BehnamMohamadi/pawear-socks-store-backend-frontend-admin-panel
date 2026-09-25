@@ -7,6 +7,11 @@ exports.viewContext = async (req, res, next) => {
     res.locals.user = null;
     res.locals.cartCount = 0;
     res.locals.wishlistIds = [];
+    res.locals.catalogColorCodes = Object.create(null);
+    if (req.path==='/' || /^\/(shop|boxes|account|wishlist)(\/|$)/.test(req.path)) {
+      const colors = await require('../models/product-models/color-option-model').find().select('name code').lean();
+      for (const color of colors) res.locals.catalogColorCodes[color.name] = color.code;
+    }
     res.locals.currentPath = req.path;
     res.locals.money = n => Number(n || 0).toLocaleString('fa-IR') + ' تومان';
     res.locals.date = d => d ? new Date(d).toLocaleString('fa-IR') : '—';
